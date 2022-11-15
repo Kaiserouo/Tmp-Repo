@@ -1,0 +1,15 @@
+# requirements
+# torch==1.12.1
+tensorflow==2.10.0
+transformers
+datasets==2.5.2
+accelerate==0.13.0
+multiprocess==0.70.13   # https://github.com/huggingface/datasets/issues/5162
+sentencepiece
+rouge
+spacy
+nltk
+ckiptagger
+tqdm
+pandas
+jsonlines
