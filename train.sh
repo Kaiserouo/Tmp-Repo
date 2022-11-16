@@ -18,10 +18,10 @@ gradient_accumulation_steps=4
 
 seed=0
 patience=5000
-record_steps=10
+record_steps=1000
 num_beams=2
 
-python3.9 training.py \
+python training.py \
     --model_name_or_path "${model_name_or_path}" \
     --train_file "${train_file}" \
     --validation_file "${validation_file}" \

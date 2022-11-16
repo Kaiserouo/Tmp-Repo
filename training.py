@@ -40,6 +40,23 @@ import numpy as np
     complain, and torch.cuda will still be available. Magic stuff, I know.
 """
 torch.cuda.is_available()
+
+"""
+    Uhh... we also have to disable tensorflow's ability to use GPU
+    or it will take > 16GB GPU memory for tw_rouge and model
+"""
+import tensorflow as tf
+try:
+    print(tf.config.get_visible_devices())
+    tf.config.set_visible_devices([], 'GPU')
+    print(tf.config.get_visible_devices())
+    visible_devices = tf.config.get_visible_devices()
+    for device in visible_devices:
+        assert device.device_type != 'GPU'
+except Exception as e:
+    # Invalid device or cannot modify virtual devices once initialized.
+    print(e.what())
+
 from tw_rouge import get_rouge
 
 
