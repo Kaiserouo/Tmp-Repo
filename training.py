@@ -466,7 +466,7 @@ def calculateRougeScore(model, tokenizer, val_dataloader, accelerator):
     # result = metric.compute(use_stemmer=True)
     # result = {k: round(v * 100, 4) for k, v in result.items()}
     result = get_rouge(preds, refs)
-    return result
+    return {k: round(v["f"] * 100, 4) for k, v in result.items()}
 
 def prettyPrintResult(accelerator, complete_step, rouge_result, val_loss):
     accelerator.print(f'Step: {complete_step}')
@@ -478,7 +478,10 @@ def mainTraining(args):
     Must have train & valid file
     """
     # Initialize accelerator
-    accelerator = Accelerator(fp16=args.fp16)
+    accelerator = Accelerator(
+        fp16=args.fp16,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
+    )
 
     # logging verbosity to INFO for the main process only.
     setAcceleratorLoggingVerbosity(accelerator)
@@ -554,7 +557,7 @@ def mainTraining(args):
                             "step": complete_step,
                             "rouge_result": rouge_result,
                             "val_loss": val_loss
-                        }))
+                        }) + '\n')
 
                     saveModel(args, accelerator, model, tokenizer)
 

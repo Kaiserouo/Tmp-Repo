@@ -11,14 +11,14 @@ lr_scheduler_type="constant_with_warmup"
 num_warmup_steps=1000
 weight_decay=0
 
-num_epochs=10
+num_epochs=30
 train_batch_size=1
 eval_batch_size=8
 gradient_accumulation_steps=4
 
 seed=0
-patience=5000
-record_steps=1000
+patience=10000
+record_steps=2500
 num_beams=2
 
 python training.py \
