@@ -395,17 +395,21 @@ def calculateValidLoss(model, val_dataloader, accelerator):
 
     return val_loss
 
-def postprocess_text(preds, labels):
-    preds = [pred.strip() for pred in preds]
-    labels = [label.strip() for label in labels]
+def postprocess_text(texts):
+    """ postprocess pred & label, used in original huggingface script """
+    texts = [text.strip() for text in texts]
 
     # rougeLSum expects newline after each sentence
-    preds = ["\n".join(nltk.sent_tokenize(pred)) for pred in preds]
-    labels = ["\n".join(nltk.sent_tokenize(label)) for label in labels]
+    texts = ["\n".join(nltk.sent_tokenize(text)) for text in texts]
 
-    return preds, labels
+    return texts
 
-def calculateRougeScore(model, tokenizer, val_dataloader, accelerator):
+def generateValTitle(args, model, tokenizer, val_dataloader, accelerator):
+    """ 
+        generate titles, as well as give back the actual labels
+        if actual labels is not accessible then return a empty list instead
+    """
+
     # if args.val_max_target_length is None:
     #     args.val_max_target_length = args.max_target_length
 
@@ -413,7 +417,7 @@ def calculateRougeScore(model, tokenizer, val_dataloader, accelerator):
 
     gen_kwargs = {
         # "max_length": args.val_max_target_length if args is not None else config.max_length,
-        "max_length": args.max_target_length if args is not None else config.max_length,
+        "max_length": args.max_target_length,
         "num_beams": args.num_beams,
     }
 
@@ -421,9 +425,10 @@ def calculateRougeScore(model, tokenizer, val_dataloader, accelerator):
     refs = []
 
     for step, batch in tqdm(enumerate(val_dataloader), disable=not accelerator.is_main_process,
-                            desc="Calculating rouge score", total=len(val_dataloader)):
+                            desc="Generating val titles...", total=len(val_dataloader)):
 
         with torch.no_grad():
+            # predicted (generated) title
             generated_tokens = accelerator.unwrap_model(model).generate(
                 batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -433,38 +438,40 @@ def calculateRougeScore(model, tokenizer, val_dataloader, accelerator):
             generated_tokens = accelerator.pad_across_processes(
                 generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
             )
-            labels = batch["labels"]
-            # if not args.pad_to_max_length:
-            #     # If we did not pad to max length, we need to pad the labels too
-            #     labels = accelerator.pad_across_processes(batch["labels"], dim=1, pad_index=tokenizer.pad_token_id)
 
-            generated_tokens, labels = accelerator.gather_for_metrics((generated_tokens, labels))
+            generated_tokens = accelerator.gather_for_metrics(generated_tokens)
             generated_tokens = generated_tokens.cpu().numpy()
-            labels = labels.cpu().numpy()
 
-            # if args.ignore_pad_token_for_loss:
-                # Replace -100 in the labels as we can't decode them.
-            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
             if isinstance(generated_tokens, tuple):
                 generated_tokens = generated_tokens[0]
             decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-            # decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
-
+            # decoded_preds = postprocess_text(decoded_preds)
             decoded_preds = accelerator.gather_for_metrics(decoded_preds)
-            decoded_labels = accelerator.gather_for_metrics(decoded_labels)
-            # accelerator.print(f'decoded_preds / labels: {list(zip(decoded_preds, decoded_labels))}')
 
-            # send to tw_rouge
             preds.extend([s.strip() + '\n' for s in decoded_preds])
-            refs.extend([s.strip() + '\n' for s in decoded_labels])
-            # metric.add_batch(
-            #     predictions=decoded_preds,
-            #     references=decoded_labels,
-            # )
-    # result = metric.compute(use_stemmer=True)
-    # result = {k: round(v * 100, 4) for k, v in result.items()}
+
+            # actual labels
+            if "labels" in batch.keys():
+                labels = batch["labels"]
+                labels = accelerator.gather_for_metrics(labels)
+                # if not args.pad_to_max_length:
+                #     # If we did not pad to max length, we need to pad the labels too
+                #     labels = accelerator.pad_across_processes(batch["labels"], dim=1, pad_index=tokenizer.pad_token_id)
+                labels = labels.cpu().numpy()
+                # if args.ignore_pad_token_for_loss:
+                    # Replace -100 in the labels as we can't decode them.
+                labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+                decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+                # decoded_labels = postprocess_text(decoded_labels)
+                decoded_labels = accelerator.gather_for_metrics(decoded_labels)
+
+                refs.extend([s.strip() + '\n' for s in decoded_labels])
+
+    return preds, refs
+
+
+def calculateRougeScore(preds, refs):
     result = get_rouge(preds, refs)
     return {k: round(v["f"] * 100, 4) for k, v in result.items()}
 
@@ -547,7 +554,13 @@ def mainTraining(args):
                     # record & save
                     model.eval()
 
-                    rouge_result = calculateRougeScore(model, tokenizer, val_dataloader, accelerator)
+                    preds, refs = generateValTitle(args, model, tokenizer, val_dataloader, accelerator)
+                    with open(os.path.join(args.output_dir, f'preds_{complete_step}.json'), 'a', encoding='utf-8') as fout:
+                        json.dump(preds, fout, ensure_ascii=False)
+                    with open(os.path.join(args.output_dir, 'refs.json'), 'a', encoding='utf-8') as fout:
+                        json.dump(refs, fout, ensure_ascii=False)
+
+                    rouge_result = calculateRougeScore(preds, refs)
                     val_loss = calculateValidLoss(model, val_dataloader, accelerator)
 
                     prettyPrintResult(accelerator, complete_step, rouge_result, val_loss)

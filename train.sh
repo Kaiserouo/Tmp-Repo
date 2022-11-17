@@ -11,7 +11,7 @@ lr_scheduler_type="constant_with_warmup"
 num_warmup_steps=1000
 weight_decay=0
 
-num_epochs=30
+num_epochs=10
 train_batch_size=1
 eval_batch_size=8
 gradient_accumulation_steps=4
