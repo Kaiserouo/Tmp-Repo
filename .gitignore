@@ -1,3 +1,6 @@
 output_model
 transformers
 data
+data.zip
+__pycache__
+output_model_1

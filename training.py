@@ -171,7 +171,23 @@ def parse_args():
         group = parser.add_argument_group('Recoding')
         group.add_argument(
             "--record_steps", type=int, default=3000,
-            help="Record valid score & save model (if better) every this amount of steps. Should be > 0",
+            help="Record valid score & save model every this amount of steps. Should be > 0",
+        )
+        group.add_argument(
+            "--save_each_model", action="store_true",
+            help="Whether to record each model every record_steps. If false then directly store the model"
+                 "into args.output_dir, else store into args.output_dir / f'steps_{completed_steps}'"
+        )
+        group.add_argument(
+            "--calc_rouge", action="store_true",
+            help="Whether to calculate rouge score in each record or not. This will impact RNG and thus "
+                 "different record steps will also impact the model outcome. "
+        )
+        group.add_argument(
+            "--store_pred_ref", action="store_true",
+            help="Whether to store prediction result & ref result. "
+                 "Will be stored at output_dir/preds_{complete_step}.json and output_dir/ref.json. "
+                 "Only works when --calc_rouge."
         )
 
     def generateArguments(parser):
@@ -233,22 +249,24 @@ def preprocess_examples(examples, tokenizer, prefix, max_input_length, max_targe
 
     # encode the documents
     articles = examples['maintext']
-    summaries = examples['title']
     
     inputs = [prefix + article for article in articles]
     model_inputs = tokenizer(inputs, max_length=max_input_length, padding="max_length", truncation=True)
 
-    # encode the summaries
-    labels = tokenizer(summaries, max_length=max_target_length, padding="max_length", truncation=True).input_ids
+    if "title" in examples.keys():
+        summaries = examples['title']
 
-    # important: we need to replace the index of the padding tokens by -100
-    # such that they are not taken into account by the CrossEntropyLoss
-    labels_with_ignore_index = []
-    for labels_example in labels:
-        labels_example = [label if label != tokenizer.pad_token_id else -100 for label in labels_example]
-        labels_with_ignore_index.append(labels_example)
-    
-    model_inputs["labels"] = labels_with_ignore_index
+        # encode the summaries
+        labels = tokenizer(summaries, max_length=max_target_length, padding="max_length", truncation=True).input_ids
+
+        # important: we need to replace the index of the padding tokens by -100
+        # such that they are not taken into account by the CrossEntropyLoss
+        labels_with_ignore_index = []
+        for labels_example in labels:
+            labels_example = [label if label != tokenizer.pad_token_id else -100 for label in labels_example]
+            labels_with_ignore_index.append(labels_example)
+        
+        model_inputs["labels"] = labels_with_ignore_index
 
     return model_inputs
 
@@ -326,14 +344,22 @@ def loadTokenizer(args):
         raise ValueError("Did not specify tokenizer")
     return tokenizer
 
-def saveModel(args, accelerator, model, tokenizer):
+def saveModel(args, accelerator, model, tokenizer, complete_step=None):
+    if args.save_each_model and complete_step is not None:
+        output_dir = os.path.join(args.output_dir, f"steps_{complete_step}")
+    else:
+        output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    accelerator.print(f"[*] Saving model at {output_dir}")
+
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.save_pretrained(
-        args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+        output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
     )
     if accelerator.is_main_process:
-        tokenizer.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(output_dir)
 
 def makeOptimizer(args, model):
     no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
@@ -404,10 +430,11 @@ def postprocess_text(texts):
 
     return texts
 
-def generateValTitle(args, model, tokenizer, val_dataloader, accelerator):
+def generateTitle(args, model, tokenizer, dataloader, accelerator):
     """ 
         generate titles, as well as give back the actual labels
         if actual labels is not accessible then return a empty list instead
+        will add '\n' after all lines
     """
 
     # if args.val_max_target_length is None:
@@ -424,8 +451,8 @@ def generateValTitle(args, model, tokenizer, val_dataloader, accelerator):
     preds = []
     refs = []
 
-    for step, batch in tqdm(enumerate(val_dataloader), disable=not accelerator.is_main_process,
-                            desc="Generating val titles...", total=len(val_dataloader)):
+    for step, batch in tqdm(enumerate(dataloader), disable=not accelerator.is_main_process,
+                            desc="Generating titles...", total=len(dataloader)):
 
         with torch.no_grad():
             # predicted (generated) title
@@ -470,15 +497,14 @@ def generateValTitle(args, model, tokenizer, val_dataloader, accelerator):
 
     return preds, refs
 
-
 def calculateRougeScore(preds, refs):
     result = get_rouge(preds, refs)
     return {k: round(v["f"] * 100, 4) for k, v in result.items()}
 
-def prettyPrintResult(accelerator, complete_step, rouge_result, val_loss):
+def prettyPrintResult(accelerator, complete_step, result):
     accelerator.print(f'Step: {complete_step}')
-    accelerator.print(f'val_loss: {val_loss}')
-    accelerator.print(f'Rouge_result: {json.dumps(rouge_result)}')
+    accelerator.print(f'Result: {result}')
+    
 
 def mainTraining(args):
     """
@@ -495,6 +521,12 @@ def mainTraining(args):
 
     # The seed need to be set before we instantiate the model, as it will determine the random head.
     set_seed(args.seed)
+
+    # prepare output dir stuff
+    if args.output_dir is not None:
+        prepareOutputDir(args)
+    
+    # write parameter
 
     # Instantiate the model, let Accelerate handle the device placement.
     model = loadModel(args)
@@ -519,18 +551,14 @@ def mainTraining(args):
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
 
-    # prepare output dir stuff
-    if args.output_dir is not None:
-        prepareOutputDir(args)
-
     # Now we train the model
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     steps_no_improve = 0
     complete_step = 0
     min_val_loss = 1000000
+    progress_bar = tqdm(range(num_update_steps_per_epoch * args.num_epochs), disable=not accelerator.is_main_process)
     for epoch in range(args.num_epochs):
         # We only enable the progress bar on the main process to avoid having 8 progress bars.
-        progress_bar = tqdm(range(num_update_steps_per_epoch), disable=not accelerator.is_main_process)
         progress_bar.set_description(f"Epoch: {epoch}")
 
         # --- TRAINING ---
@@ -544,35 +572,38 @@ def mainTraining(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                progress_bar.set_postfix({'loss': loss.item()})
             
             if accelerator.sync_gradients:
-                progress_bar.set_postfix({'loss': loss.item()})
                 progress_bar.update(1)
                 complete_step += 1
 
                 if args.record_steps is not None and complete_step % args.record_steps == 0:
                     # record & save
+                    accelerator.print(f"[*] Reached checkpoint {complete_step}")
                     model.eval()
 
-                    preds, refs = generateValTitle(args, model, tokenizer, val_dataloader, accelerator)
-                    with open(os.path.join(args.output_dir, f'preds_{complete_step}.json'), 'a', encoding='utf-8') as fout:
-                        json.dump(preds, fout, ensure_ascii=False)
-                    with open(os.path.join(args.output_dir, 'refs.json'), 'a', encoding='utf-8') as fout:
-                        json.dump(refs, fout, ensure_ascii=False)
+                    result = {"steps": complete_step}
 
-                    rouge_result = calculateRougeScore(preds, refs)
+                    if args.calc_rouge:
+                        preds, refs = generateTitle(args, model, tokenizer, val_dataloader, accelerator)
+                        if args.store_pred_ref:
+                            with open(os.path.join(args.output_dir, f'preds_{complete_step}.json'), 'a', encoding='utf-8') as fout:
+                                json.dump(preds, fout, ensure_ascii=False)
+                            with open(os.path.join(args.output_dir, 'refs.json'), 'a', encoding='utf-8') as fout:
+                                json.dump(refs, fout, ensure_ascii=False)
+                        rouge_result = calculateRougeScore(preds, refs)
+                        result["rouge_result"] = rouge_result
+
                     val_loss = calculateValidLoss(model, val_dataloader, accelerator)
+                    result["val_loss"] = val_loss
 
-                    prettyPrintResult(accelerator, complete_step, rouge_result, val_loss)
+                    prettyPrintResult(accelerator, complete_step, result)
 
                     with open(os.path.join(args.output_dir, 'result.json'), 'a') as fout:
-                        fout.write(json.dumps({
-                            "step": complete_step,
-                            "rouge_result": rouge_result,
-                            "val_loss": val_loss
-                        }) + '\n')
+                        fout.write(json.dumps(result) + '\n')
 
-                    saveModel(args, accelerator, model, tokenizer)
+                    saveModel(args, accelerator, model, tokenizer, complete_step)
 
                     if min_val_loss >= val_loss:
                         steps_no_improve = 0

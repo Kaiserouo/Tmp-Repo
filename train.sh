@@ -14,7 +14,7 @@ weight_decay=0
 num_epochs=10
 train_batch_size=1
 eval_batch_size=8
-gradient_accumulation_steps=4
+gradient_accumulation_steps=8
 
 seed=0
 patience=10000
@@ -39,4 +39,5 @@ python training.py \
     --patience "${patience}" \
     --record_steps "${record_steps}" \
     --num_beams "${num_beams}" \
-    --fp16
+    --fp16 \
+    --calc_rouge
